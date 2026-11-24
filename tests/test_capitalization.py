@@ -26,7 +26,9 @@ class FakeNLP:
     lang = "en"
 
     def __call__(self, _text: str):
-        return [Token("Was", "was", "PRON")]
+        # Some spaCy pipelines return a capitalized lemma for a sentence-initial
+        # token. The AnkiMorphs database may contain the same morph in lowercase.
+        return [Token("Was", "Was", "PRON")]
 
 
 class CapitalizationTests(unittest.TestCase):
@@ -52,10 +54,10 @@ class CapitalizationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_sentence_initial_capitalization_reuses_same_lemma_inflection(self) -> None:
+    def test_sentence_initial_capitalization_reuses_casefolded_lemma_and_inflection(self) -> None:
         result = self.engine._analyze_uncached("Was", "fake-model")
         self.assertEqual(result["segments"], [
-            {"text": "Was", "status": "known", "lemma": "was"}
+            {"text": "Was", "status": "known", "lemma": "Was"}
         ])
 
     def test_unknown_morph_remains_unknown_without_casefold_match(self) -> None:
@@ -64,15 +66,33 @@ class CapitalizationTests(unittest.TestCase):
         result = self.engine._analyze_uncached("Was", "fake-model")
         self.assertEqual(result["segments"][0]["status"], "unknown")
 
-    def test_lemma_is_not_casefolded(self) -> None:
+    def test_casefolded_lemma_is_used_only_after_exact_lookup_misses(self) -> None:
         intervals = self.engine._intervals_for([("Was", "Was")])
-        self.assertEqual(intervals[("Was", "Was")], 0)
+        self.assertEqual(intervals[("Was", "Was")], 50)
 
     def test_exact_inflection_match_is_preferred(self) -> None:
         with sqlite3.connect(self.db_path) as db:
             db.execute("INSERT INTO Morphs VALUES (?, ?, ?, ?)", ("was", "Was", 1, 1))
         intervals = self.engine._intervals_for([("was", "Was")])
         self.assertEqual(intervals[("was", "Was")], 1)
+
+    def test_exact_lemma_and_inflection_are_preferred_over_casefolded_rows(self) -> None:
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("INSERT INTO Morphs VALUES (?, ?, ?, ?)", ("Was", "Was", 1, 1))
+        intervals = self.engine._intervals_for([("Was", "Was")])
+        self.assertEqual(intervals[("Was", "Was")], 1)
+
+    def test_lemma_only_evaluation_has_casefolded_fallback(self) -> None:
+        self.engine.config["evaluate_morph_inflection"] = False
+        intervals = self.engine._intervals_for([("WAS", "WAS")])
+        self.assertEqual(intervals[("WAS", "WAS")], 50)
+
+    def test_casefold_fallback_handles_german_umlauts(self) -> None:
+        with sqlite3.connect(self.db_path) as db:
+            db.execute("DELETE FROM Morphs")
+            db.execute("INSERT INTO Morphs VALUES (?, ?, ?, ?)", ("ärger", "ärger", 33, 33))
+        intervals = self.engine._intervals_for([("Ärger", "Ärger")])
+        self.assertEqual(intervals[("Ärger", "Ärger")], 33)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,10 @@ assert(option_state.include_learning_in_unknown_navigation == false,
   "learning morphs must be excluded from unknown navigation by default")
 assert(option_state.auto_select_first_unknown_on_new_cue == false,
   "automatic first-unknown selection must be disabled by default")
+assert(option_state.tooltip_background_color == "&H000000&",
+  "tooltip background should default to black")
+assert(option_state.tooltip_background_opacity == 0.4,
+  "tooltip background should default to 40% opacity")
 
 local cue = {
   active = true, generation = 17, text = "Was ist?", width = 800, height = 600,
@@ -81,8 +85,15 @@ observers["mouse-pos"]("mouse-pos", mouse)
 assert(#timers > 0, "hover lookup should be delayed")
 timers[#timers].callback()
 assert(commands[1].args[1] == "dict", "dict client should be invoked")
+assert(commands[1].args[#commands[1].args] == "was",
+  "sentence-initial Was should query its lowercase spaCy lemma first")
 assert(overlay_count == 1, "companion should create only the tooltip overlay, never a duplicate subtitle word")
+assert(overlays[1].z == 10, "dictionary tooltip must render above the main subtitle overlay")
+assert(overlays[1].data:find("\\p1", 1, true), "tooltip should draw its background rectangle")
+assert(overlays[1].data:find("\\1c&H000000&", 1, true), "tooltip background should be black by default")
+assert(overlays[1].data:find("\\1a&H99&", 1, true), "40% opacity should map to ASS alpha 99")
 assert(bindings["MBTN_LEFT"], "left-click binding missing")
+assert(bindings["MBTN_RIGHT"], "right-click binding missing")
 assert(bindings["ctrl+alt+e"], "extension toggle key binding missing")
 assert(bindings["ctrl+alt+LEFT"], "previous-word key binding missing")
 assert(bindings["ctrl+alt+RIGHT"], "next-word key binding missing")
@@ -142,6 +153,32 @@ bindings["ctrl+alt+b"]()
 local morph_action = commands[before_selected_morph_action + 1]
 assert(morph_action.args[5] == "ist", "lemma-dependent action should receive the selected surface word")
 assert(morph_action.args[7] == "sein", "lemma-dependent action should receive the selected lemma")
+
+-- Mouse actions must use the morph at the click position, not the currently
+-- keyboard-selected morph. Even if mpv reports hover=false during a button
+-- event, the pointer coordinates should still resolve the clicked word.
+mouse = {x = 380, y = 530, hover = false}
+local timers_before_left_click = #timers
+bindings["MBTN_LEFT"]()
+assert(#timers == timers_before_left_click + 1,
+  "left-click action should defer target resolution until the event-loop tick")
+timers[#timers].callback()
+local left_click_action = commands[#commands]
+assert(left_click_action.args[1] == "/bin/sh", "left click should execute through the shell")
+assert(left_click_action.args[5] == "Was", "left click must pass the clicked surface word, not the keyboard selection")
+assert(left_click_action.args[7] == "was", "left click must pass the clicked word's spaCy lemma")
+
+mouse = {x = 435, y = 530, hover = false}
+local timers_before_right_click = #timers
+bindings["MBTN_RIGHT"]()
+assert(#timers == timers_before_right_click + 1,
+  "right-click action should defer target resolution until the event-loop tick")
+timers[#timers].callback()
+local right_click_action = commands[#commands]
+assert(right_click_action.args[1] == "/bin/sh", "right click should execute through the shell")
+assert(right_click_action.args[5] == "ist", "right click must pass the clicked surface word")
+assert(right_click_action.args[7] == "sein", "right click must pass the clicked word's spaCy lemma")
+
 bindings["ctrl+alt+d"]()
 assert(overlays[1].data:find("Was", 1, true) or overlays[1].data:find("ist", 1, true), "dictionary shortcut should show a tooltip")
 local commands_before_lemma_lookup = #commands
@@ -162,17 +199,6 @@ assert(keyboard_action.args[3]:find("phrase=$2", 1, true), "action wrapper shoul
 assert(keyboard_action.args[3]:find("lemma=$3", 1, true), "action wrapper should define $lemma")
 assert(keyboard_action.args[3]:find("export word phrase lemma", 1, true), "named variables should be exported")
 
--- Mouse clicks still target the word under the pointer, independently of the
--- keyboard selection.
-mouse = {x = 400, y = 530, hover = true}
-observers["mouse-pos"]("mouse-pos", mouse)
-bindings["MBTN_LEFT"]()
-local action = commands[#commands]
-assert(action.args[1] == "/bin/sh")
-assert(action.args[4] == "ankimorphs-dict")
-assert(action.args[5] == "Was")
-assert(action.args[6] == "Was ist?")
-assert(action.args[7] == "was")
 -- Re-open the selected morph tooltip so the geometry-refresh assertion below
 -- exercises the intended same-cue tooltip preservation path.
 bindings["ctrl+alt+g"]()

@@ -130,6 +130,13 @@ class AnkiMorphsEngine:
         self._cache_lock = threading.RLock()
         self._result_cache: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
         self._cache_limit = 12000
+        # Built lazily only if an exact Morphs lookup misses. The index gives
+        # us a Unicode-aware case-insensitive fallback for sentence-initial
+        # capitalization without paying for a full-table scan on normal cues.
+        self._casefold_morph_rows: dict[
+            str, list[tuple[str, int | None, int | None]]
+        ] | None = None
+        self._casefold_morph_rows_fingerprint: tuple[int, int] | None = None
         self._prefetch_queue: queue.Queue[tuple[int, str, str, str]] = queue.Queue()
         self._prefetch_lock = threading.RLock()
         self._prefetch_job_id = 0
@@ -252,7 +259,14 @@ class AnkiMorphsEngine:
         return value
 
     def _intervals_for(self, morphs: list[tuple[str, str]]) -> dict[tuple[str, str], int]:
-        """Read the exact Morphs-table interval fields used by am-highlight."""
+        """Read AnkiMorphs intervals, preferring exact keys then casefolded keys.
+
+        AnkiMorphs stores the lemma and inflection exactly as its morphemizer
+        emitted them. Its text highlighter lowercases the expression before
+        locating those inflections. A subtitle can therefore contain ``Was``
+        while the database contains ``was``. Treat a capitalization-only key
+        difference as the same lookup *only after* the exact key misses.
+        """
         if not self.db_path.is_file():
             raise FileNotFoundError(f"AnkiMorphs database not found: {self.db_path}")
         uri = self.db_path.resolve().as_uri() + "?mode=ro"
@@ -262,12 +276,55 @@ class AnkiMorphsEngine:
         try:
             found: dict[tuple[str, str], int] = {}
             evaluate_inflection = bool(self.config["evaluate_morph_inflection"])
-            # Cache each lemma's rows only when an exact-case inflection lookup
-            # misses. This preserves AnkiMorphs' exact match semantics first,
-            # while allowing sentence-initial capitalization ("Was" vs "was")
-            # to reuse the same lexical inflection. The lemma remains exact so
-            # German case-sensitive lexical distinctions are not merged.
-            inflection_rows_by_lemma: dict[str, list[tuple[str, int | None]]] = {}
+            rows_by_lemma: dict[
+                str, list[tuple[str, int | None, int | None]]
+            ] = {}
+
+            def exact_lemma_rows(lemma: str) -> list[tuple[str, int | None, int | None]]:
+                rows = rows_by_lemma.get(lemma)
+                if rows is None:
+                    rows = connection.execute(
+                        "SELECT inflection, highest_inflection_learning_interval, "
+                        "highest_lemma_learning_interval FROM Morphs WHERE lemma = ?",
+                        (lemma,),
+                    ).fetchall()
+                    rows_by_lemma[lemma] = [
+                        (str(inflection), inflection_interval, lemma_interval)
+                        for inflection, inflection_interval, lemma_interval in rows
+                    ]
+                return rows
+
+            def casefold_rows_by_lemma() -> dict[
+                str, list[tuple[str, int | None, int | None]]
+            ]:
+                """Return a cached Unicode-casefolded index of Morphs rows."""
+                try:
+                    stat_result = self.db_path.stat()
+                    fingerprint = (stat_result.st_mtime_ns, stat_result.st_size)
+                except OSError:
+                    fingerprint = None
+
+                cached = getattr(self, "_casefold_morph_rows", None)
+                cached_fingerprint = getattr(
+                    self, "_casefold_morph_rows_fingerprint", None
+                )
+                if cached is not None and cached_fingerprint == fingerprint:
+                    return cached
+
+                raw_rows = connection.execute(
+                    "SELECT lemma, inflection, highest_inflection_learning_interval, "
+                    "highest_lemma_learning_interval FROM Morphs"
+                ).fetchall()
+                index: dict[str, list[tuple[str, int | None, int | None]]] = {}
+                for row_lemma, row_inflection, inflection_interval, lemma_interval in raw_rows:
+                    index.setdefault(str(row_lemma).casefold(), []).append(
+                        (str(row_inflection), inflection_interval, lemma_interval)
+                    )
+
+                self._casefold_morph_rows = index
+                self._casefold_morph_rows_fingerprint = fingerprint
+                return index
+
             for lemma, inflection in set(morphs):
                 if evaluate_inflection:
                     row = connection.execute(
@@ -276,20 +333,23 @@ class AnkiMorphsEngine:
                         (lemma, inflection),
                     ).fetchone()
                     if row is None:
-                        rows = inflection_rows_by_lemma.get(lemma)
-                        if rows is None:
-                            rows = connection.execute(
-                                "SELECT inflection, highest_inflection_learning_interval "
-                                "FROM Morphs WHERE lemma = ?",
-                                (lemma,),
-                            ).fetchall()
-                            inflection_rows_by_lemma[lemma] = rows
                         folded_inflection = inflection.casefold()
                         matching_intervals = [
                             candidate_interval
-                            for candidate_inflection, candidate_interval in rows
+                            for candidate_inflection, candidate_interval, _ in exact_lemma_rows(lemma)
                             if str(candidate_inflection).casefold() == folded_inflection
                         ]
+                        # If the exact lemma itself differs only by case (for
+                        # example, spaCy returns ``Was`` while AnkiMorphs stored
+                        # ``was``), search the full Unicode-casefolded index.
+                        # Exact lemma matches above always take precedence.
+                        if not matching_intervals:
+                            matching_intervals = [
+                                candidate_interval
+                                for candidate_inflection, candidate_interval, _ in
+                                casefold_rows_by_lemma().get(lemma.casefold(), [])
+                                if candidate_inflection.casefold() == folded_inflection
+                            ]
                         value = max(
                             (int(candidate) for candidate in matching_intervals if candidate is not None),
                             default=0,
@@ -302,7 +362,18 @@ class AnkiMorphsEngine:
                         "WHERE lemma = ? LIMIT 1",
                         (lemma,),
                     ).fetchone()
-                    value = 0 if row is None or row[0] is None else int(row[0])
+                    if row is not None:
+                        value = 0 if row[0] is None else int(row[0])
+                    else:
+                        matching_intervals = [
+                            lemma_interval
+                            for _, _, lemma_interval in
+                            casefold_rows_by_lemma().get(lemma.casefold(), [])
+                        ]
+                        value = max(
+                            (int(candidate) for candidate in matching_intervals if candidate is not None),
+                            default=0,
+                        )
                 found[(lemma, inflection)] = value
             return found
         finally:
@@ -341,7 +412,9 @@ class AnkiMorphsEngine:
                 settings_payload = repr(self.config)
             spaCy_version = getattr(self._spacy, "__version__", "unknown")
             namespace_payload = {
-                "cache_format": 3,
+                # Bumped because older /tmp entries may contain incorrect
+                # unknown statuses for capitalized forms.
+                "cache_format": 4,
                 "db": self._path_fingerprint(self.db_path),
                 "settings_file": self._path_fingerprint(profile_settings),
                 "names_file": self._path_fingerprint(self.names_path),

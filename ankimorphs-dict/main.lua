@@ -18,6 +18,11 @@ local o = {
     tooltip_font_size = 21,
     tooltip_max_lines = 9,
     tooltip_max_chars = 440,
+    tooltip_background_color = "&H000000&", -- ASS BGR; black by default
+    tooltip_background_opacity = 0.4,       -- 0 = transparent, 1 = opaque
+    tooltip_padding_x = 12,
+    tooltip_padding_y = 8,
+    tooltip_collision_gap = 14,
     hit_width_scale = 1.0,
     -- Toggle this companion extension without affecting AnkiMorphs highlighting.
     toggle_extension_key = "ctrl+alt+e",
@@ -72,6 +77,8 @@ local dictionary_pending = {}
 local tooltip_text = nil
 local tooltip_anchor_segment_index = nil
 local tooltip_overlay = mp.create_osd_overlay("ass-events")
+-- The main subtitle/highlight overlay uses z=0. Keep the dictionary on top.
+tooltip_overlay.z = 10
 local show_dictionary_for_target = nil
 
 local function trim(value)
@@ -233,12 +240,23 @@ local function cue_geometry()
 
     local lines = split_lines(text)
     local line_by_byte = {}
+    local bounds = { left = width, top = height, right = 0, bottom = 0 }
+    local has_visible_line = false
     for index, line in ipairs(lines) do
         line.width = text_width(line.text, font_size)
         if line.width > width - 24 then
             -- mpv/libass may wrap this line automatically. Without libass glyph
             -- extents, don't guess at a word's position.
             return nil
+        end
+        line.left = width / 2 - line.width / 2
+        line.top = height - bottom_margin - (#lines - index + 1) * line_height
+        if line.text:find("%S") then
+            has_visible_line = true
+            bounds.left = math.min(bounds.left, line.left)
+            bounds.right = math.max(bounds.right, line.left + line.width)
+            bounds.top = math.min(bounds.top, line.top)
+            bounds.bottom = math.max(bounds.bottom, line.top + line_height)
         end
         for byte_index = line.first, line.last do
             line_by_byte[byte_index] = index
@@ -248,6 +266,7 @@ local function cue_geometry()
         text = text, width = width, height = height, font_size = font_size,
         bottom_margin = bottom_margin, line_height = line_height,
         lines = lines, line_by_byte = line_by_byte,
+        bounds = has_visible_line and bounds or nil,
     }
 end
 
@@ -282,6 +301,7 @@ local function build_targets()
                     phrase = sentence_for(geometry.text, first, last),
                     status = segment.status,
                     segment_index = segment_index,
+                    cue_bounds = geometry.bounds,
                     x = left,
                     y = line_top,
                     width = text_width(surface, geometry.font_size),
@@ -295,9 +315,9 @@ local function build_targets()
     return result
 end
 
-local function hit_test(mouse)
+local function hit_test(mouse, allow_non_hover)
     if not extension_enabled then return nil end
-    if type(mouse) == "table" and mouse.hover == false then return nil end
+    if not allow_non_hover and type(mouse) == "table" and mouse.hover == false then return nil end
     if type(mouse) ~= "table" or type(mouse.x) ~= "number" or type(mouse.y) ~= "number" then
         return nil
     end
@@ -503,23 +523,84 @@ local function render_tooltip(value, anchor, force)
     local fs = tonumber(o.tooltip_font_size) or 21
     local lines = 1
     for _ in tooltip_text:gmatch("\n") do lines = lines + 1 end
-    local estimate_width = 0
+    local content_width = 0
     for line in (tooltip_text .. "\n"):gmatch("(.-)\n") do
-        estimate_width = math.max(estimate_width, text_width(line, fs))
+        content_width = math.max(content_width, text_width(line, fs))
     end
-    estimate_width = math.min(width - 20, estimate_width + 24)
-    local estimate_height = lines * fs * 1.28 + 16
-    local x = (anchor.x or 0) + 18
-    local y = (anchor.y or 0) + 22
-    if x + estimate_width > width - 8 then x = math.max(8, width - estimate_width - 8) end
-    if y + estimate_height > height - 8 then y = math.max(8, (anchor.y or 0) - estimate_height - 14) end
+    local padding_x = math.max(0, tonumber(o.tooltip_padding_x) or 12)
+    local padding_y = math.max(0, tonumber(o.tooltip_padding_y) or 8)
+    local box_width = math.min(math.max(1, width - 16), content_width + padding_x * 2)
+    local box_height = math.min(math.max(1, height - 16), lines * fs * 1.28 + padding_y * 2)
+    local gap = math.max(0, tonumber(o.tooltip_collision_gap) or 14)
+    local anchor_x = (anchor.x or width / 2) + (anchor.width or 0) / 2
+    local anchor_y = (anchor.y or height / 2) + (anchor.font_size or fs) * 1.22 / 2
+    local best_x, best_y, best_score
+
+    -- Prefer locations outside the entire subtitle block, not merely outside
+    -- the selected word. If the video leaves no free region, minimize overlap.
+    local function consider_position(candidate_x, candidate_y)
+        local max_x = math.max(8, width - box_width - 8)
+        local max_y = math.max(8, height - box_height - 8)
+        local x = math.max(8, math.min(max_x, candidate_x))
+        local y = math.max(8, math.min(max_y, candidate_y))
+        local overlap = 0
+        local bounds = anchor.cue_bounds
+        if bounds then
+            local overlap_width = math.max(0,
+                math.min(x + box_width, bounds.right) - math.max(x, bounds.left))
+            local overlap_height = math.max(0,
+                math.min(y + box_height, bounds.bottom) - math.max(y, bounds.top))
+            overlap = overlap_width * overlap_height
+        end
+        local distance = math.abs(x + box_width / 2 - anchor_x)
+            + math.abs(y + box_height / 2 - anchor_y)
+        local score = overlap * 1000 + distance
+        if not best_score or score < best_score then
+            best_x, best_y, best_score = x, y, score
+        end
+    end
+
+    local bounds = anchor.cue_bounds
+    if bounds then
+        consider_position(bounds.right + gap, anchor_y - box_height / 2)
+        consider_position(bounds.left - box_width - gap, anchor_y - box_height / 2)
+        consider_position(anchor_x - box_width / 2, bounds.top - box_height - gap)
+        consider_position(anchor_x - box_width / 2, bounds.bottom + gap)
+    end
+    -- Word-relative candidates are useful when subtitle geometry is unavailable.
+    consider_position((anchor.x or 0) + (anchor.width or 0) + gap,
+        anchor_y - box_height / 2)
+    consider_position((anchor.x or 0) - box_width - gap,
+        anchor_y - box_height / 2)
+    consider_position(anchor_x - box_width / 2,
+        (anchor.y or 0) - box_height - gap)
+    consider_position(anchor_x - box_width / 2,
+        (anchor.y or 0) + (anchor.font_size or fs) * 1.22 + gap)
+
+    local box_x, box_y = best_x or 8, best_y or 8
+    local text_x, text_y = box_x + padding_x, box_y + padding_y
+    local background_color = trim(o.tooltip_background_color)
+    if not background_color:match("^&H[%x]+&$") then
+        background_color = "&H000000&"
+    end
+    local opacity = tonumber(o.tooltip_background_opacity)
+    if opacity == nil then opacity = 0.4 end
+    opacity = math.max(0, math.min(1, opacity))
+    -- ASS alpha is transparency: 00 is opaque and FF is transparent.
+    local background_alpha = string.format("&H%02X&", math.floor((1 - opacity) * 255 + 0.5))
+    local background = string.format(
+        "{\\an7\\p1\\bord0\\shad0\\1c%s\\1a%s\\pos(%.1f,%.1f)}"
+            .. "m 0 0 l %.1f 0 l %.1f %.1f l 0 %.1f{\\p0}",
+        background_color, background_alpha, box_x, box_y,
+        box_width, box_width, box_height, box_height
+    )
     local header = string.format(
-        "{\\an7\\q2\\fs%d\\fnNoto Sans\\bord2\\shad1\\1c&HFFFFFF&\\3c&H202020&\\pos(%.1f,%.1f)}",
-        fs, x, y
+        "{\\an7\\q2\\fs%d\\fnNoto Sans\\bord2\\shad1\\1c&HFFFFFF&\\1a&H00&\\3c&H202020&\\pos(%.1f,%.1f)}",
+        fs, text_x, text_y
     )
     tooltip_overlay.res_x = width
     tooltip_overlay.res_y = height
-    tooltip_overlay.data = header .. ass_escape(tooltip_text)
+    tooltip_overlay.data = background .. header .. ass_escape(tooltip_text)
     tooltip_overlay:update()
 end
 
@@ -531,10 +612,24 @@ local function output_is_no_match(value)
         or lower:find("no definition found", 1, true)
 end
 
+local function unicode_lower(value)
+    -- Lua's built-in string.lower() is locale-dependent and commonly only
+    -- handles ASCII in mpv's default C locale. German dictionary lookups also
+    -- need the three umlauts and capital sharp-S normalized.
+    value = tostring(value or "")
+    value = value:gsub("Ä", "ä"):gsub("Ö", "ö"):gsub("Ü", "ü")
+    value = value:gsub("ẞ", "ß")
+    return value:lower()
+end
+
 local function dict_lookup(word, lemma, done)
     local query = trim(word)
     if query == "" then done("No dictionary entry found."); return end
-    local cache_key = query:lower()
+    local normalized_lemma = trim(lemma)
+    -- Do not merge cache entries solely by lowercased surface form: German
+    -- capitalization can distinguish nouns ("Morgen") from other words
+    -- ("morgen"). The lemma is part of the cache identity as well.
+    local cache_key = query .. "\0" .. normalized_lemma
     if dictionary_cache[cache_key] then
         done(dictionary_cache[cache_key])
         return
@@ -545,15 +640,30 @@ local function dict_lookup(word, lemma, done)
     end
     dictionary_pending[cache_key] = { done }
 
-    local args = { tostring(o.dict_program), "-d", tostring(o.dict_database), "--", query }
-    if trim(o.dict_host) ~= "" then
-        table.insert(args, 2, "-h")
-        table.insert(args, 3, tostring(o.dict_host))
+    local candidates, seen = {}, {}
+    local function add_candidate(value)
+        value = trim(value)
+        if value ~= "" and not seen[value] then
+            seen[value] = true
+            candidates[#candidates + 1] = value
+        end
     end
-    if trim(o.dict_port) ~= "" then
-        table.insert(args, 2, "-p")
-        table.insert(args, 3, tostring(o.dict_port))
+
+    local folded_query = unicode_lower(query)
+    local folded_lemma = unicode_lower(normalized_lemma)
+    -- If the only difference between the surface form and lemma is
+    -- capitalization, query the lemma first. This is the common sentence-
+    -- initial case ("Was" -> "was") and avoids a case-sensitive dictd hit
+    -- shadowing the intended lowercase entry. For genuinely inflected forms,
+    -- preserve the surface-form-first behavior.
+    if normalized_lemma ~= "" and query ~= normalized_lemma
+        and folded_query == folded_lemma then
+        add_candidate(normalized_lemma)
     end
+    add_candidate(query)
+    add_candidate(unicode_lower(query))
+    add_candidate(normalized_lemma)
+    add_candidate(unicode_lower(normalized_lemma))
 
     local function complete(value)
         value = tostring(value or "No dictionary entry found.")
@@ -563,49 +673,57 @@ local function dict_lookup(word, lemma, done)
         for _, callback in ipairs(callbacks) do pcall(callback, value) end
     end
 
-    mp.command_native_async({
-        name = "subprocess",
-        args = args,
-        capture_stdout = true,
-        capture_stderr = true,
-        capture_size = 1024 * 1024,
-        playback_only = false,
-    }, function(success, result, err)
-        local output = result and (result.stdout or "") or ""
-        local stderr = result and (result.stderr or "") or ""
-        if success and result and result.status == 0 and output ~= "" and not output_is_no_match(output) then
-            complete(output)
+    local last_output, last_stderr, last_error = "", "", nil
+    local function command_args(candidate)
+        local args = { tostring(o.dict_program), "-d", tostring(o.dict_database), "--", candidate }
+        if trim(o.dict_host) ~= "" then
+            table.insert(args, 2, "-h")
+            table.insert(args, 3, tostring(o.dict_host))
+        end
+        if trim(o.dict_port) ~= "" then
+            table.insert(args, 2, "-p")
+            table.insert(args, 3, tostring(o.dict_port))
+        end
+        return args
+    end
+
+    local function try_candidate(index)
+        local candidate = candidates[index]
+        if not candidate then
+            complete(last_output ~= "" and last_output
+                or last_stderr ~= "" and last_stderr
+                or tostring(last_error or "No dictionary entry found for " .. query .. "."))
             return
         end
 
-        local fallback = trim(lemma)
-        if fallback ~= "" and fallback:lower() ~= query:lower() then
-            local fallback_args = { tostring(o.dict_program), "-d", tostring(o.dict_database), "--", fallback }
-            if trim(o.dict_host) ~= "" then
-                table.insert(fallback_args, 2, "-h")
-                table.insert(fallback_args, 3, tostring(o.dict_host))
+        mp.command_native_async({
+            name = "subprocess",
+            args = command_args(candidate),
+            capture_stdout = true,
+            capture_stderr = true,
+            capture_size = 1024 * 1024,
+            playback_only = false,
+        }, function(success, result, err)
+            local output = result and (result.stdout or "") or ""
+            local stderr = result and (result.stderr or "") or ""
+            if success and result and result.status == 0
+                and output ~= "" and not output_is_no_match(output) then
+                local was_lemma_fallback = candidate == normalized_lemma
+                    and folded_query ~= folded_lemma
+                complete(was_lemma_fallback
+                    and ("Lemma: " .. candidate .. "\n\n" .. output)
+                    or output)
+                return
             end
-            if trim(o.dict_port) ~= "" then
-                table.insert(fallback_args, 2, "-p")
-                table.insert(fallback_args, 3, tostring(o.dict_port))
-            end
-            mp.command_native_async({
-                name = "subprocess", args = fallback_args,
-                capture_stdout = true, capture_stderr = true,
-                capture_size = 1024 * 1024, playback_only = false,
-            }, function(fallback_success, fallback_result)
-                local fallback_output = fallback_result and (fallback_result.stdout or "") or ""
-                if fallback_success and fallback_result and fallback_result.status == 0
-                    and fallback_output ~= "" and not output_is_no_match(fallback_output) then
-                    complete("Lemma: " .. fallback .. "\n\n" .. fallback_output)
-                else
-                    complete(output ~= "" and output or stderr ~= "" and stderr or "No dictionary entry found for " .. query .. ".")
-                end
-            end)
-            return
-        end
-        complete(output ~= "" and output or stderr ~= "" and stderr or tostring(err or "No dictionary entry found for " .. query .. "."))
-    end)
+
+            if output ~= "" then last_output = output end
+            if stderr ~= "" then last_stderr = stderr end
+            if err ~= nil then last_error = err end
+            try_candidate(index + 1)
+        end)
+    end
+
+    try_candidate(1)
 end
 
 show_dictionary_for_target = function(target, require_selected)
@@ -714,7 +832,7 @@ local function action_requires_morph(script)
         or script:find("$3", 1, true) ~= nil
 end
 
-local function run_script(script, action_name, mouse_first)
+local function run_script(script, action_name, target_override, override_target)
     if not extension_enabled then return end
     script = trim(script)
     if script == "" then
@@ -725,8 +843,10 @@ local function run_script(script, action_name, mouse_first)
     local mouse = mp.get_property_native("mouse-pos")
     local mouse_target = hit_test(mouse)
     local selected
-    if mouse_first then
-        selected = mouse_target
+    if override_target then
+        -- Mouse handlers pass the exact target resolved from the click position.
+        -- Never substitute a different keyboard selection or stale hover target.
+        selected = target_override
     else
         selected = selected_target or hover or mouse_target
     end
@@ -774,8 +894,19 @@ local function run_script(script, action_name, mouse_first)
     end)
 end
 
-local function run_left() run_script(o.left_click_script, "left-click", true) end
-local function run_right() run_script(o.right_click_script, "right-click", true) end
+local function run_mouse_action(script, action_name)
+    if not extension_enabled then return end
+    -- Defer one event-loop tick so mpv has published the pointer position for
+    -- this mouse event. Ignore mouse-pos.hover here: some VOs report false
+    -- during button events even though the coordinates still identify the hit.
+    mp.add_timeout(0, function()
+        local clicked_target = hit_test(mp.get_property_native("mouse-pos"), true)
+        run_script(script, action_name, clicked_target, true)
+    end)
+end
+
+local function run_left() run_mouse_action(o.left_click_script, "left-click") end
+local function run_right() run_mouse_action(o.right_click_script, "right-click") end
 
 local function set_extension_enabled(value)
     value = not not value

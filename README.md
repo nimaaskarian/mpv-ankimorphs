@@ -195,9 +195,30 @@ same blue as the AnkiMorphs unknown status. The main highlighter applies the
 style override only when the cue-generation and segment index match, and
 restores the original AnkiMorphs status color when
 the selection moves, clears, or the cue changes. The selection resets when the
-subtitle cue changes. Mouse hover/click behavior remains available; clicking
-runs the script for the word
-under the pointer, while keyboard activation runs it for the selected word.
+subtitle cue changes.
+
+The dictionary tooltip is drawn as a separate ASS OSD overlay above the main
+subtitle/highlight overlay. Its background and collision spacing are
+configurable:
+
+```conf
+# ASS BGR color; default black with 40% opacity.
+tooltip_background_color=&H000000&
+tooltip_background_opacity=0.4
+tooltip_padding_x=12
+tooltip_padding_y=8
+tooltip_collision_gap=14
+```
+
+The placement logic tries positions to the left, right, above, and below the
+whole visible subtitle block, then chooses the candidate with the least
+subtitle overlap. If the video has no free space around the subtitle, it uses
+the least-overlapping position available. The tooltip overlay uses a higher
+OSD Z-order than the main highlighter so the subtitle text cannot cover it.
+
+Mouse hover/click behavior remains available; clicking runs the script for the
+word under the pointer, while keyboard activation runs it for the selected
+word.
 All keys can be changed in `ankimorphs-dict.conf` using
 `toggle_extension_key`, `select_previous_key`, `select_next_key`,
 `select_next_unknown_key`, `show_dictionary_key`, `show_lemma_dictionary_key`, `activate_left_key`, and `activate_right_key`.
@@ -230,7 +251,12 @@ exported for child processes. For backwards compatibility, positional aliases re
 named variables. The scripts in
 this configuration are arbitrary commands with the full permissions of the
 user running mpv; only put trusted commands there. Use POSIX shell syntax.
-Six optional keyboard action slots are provided. An action requires a
+Six optional keyboard action slots are provided. Left- and right-click
+handlers resolve the morph under the pointer at click time and pass that exact
+morph's surface form as `$word` and spaCy lemma as `$lemma`; they do not reuse a
+different keyboard-selected morph. Click target resolution is deferred by one
+event-loop tick so mpv has updated the pointer coordinates for the button event.
+An action requires a
 highlighted morph only when its command references `$word` or `$lemma` (or the
 legacy positional aliases `$1` or `$3`). A phrase-only action using `$phrase`
 (or `$2`) can run without any word selected. If a selected or hovered morph is
@@ -310,13 +336,22 @@ available to other configured actions).
 ## Sentence-initial capitalization
 
 The source AnkiMorphs JIT implementation preserves token inflections and asks
-its database for an exact `(lemma, inflection)` pair. That means a surface form
-`Was` can miss an otherwise known `was` row. This mpv port now does the exact
-lookup first, then falls back to a case-fold-equivalent inflection **under the
-same lemma only**. Thus sentence-initial capitalization does not turn a known
-morph into unknown, while distinct lemmas remain separate. The span is still
-matched case-insensitively in the subtitle text. The tmpfs cache format was
-bumped so cached cue results without lemma metadata are not reused.
+its database for an exact `(lemma, inflection)` pair. A subtitle may capitalize
+a sentence-initial token (`Was`) while AnkiMorphs has stored its lowercase
+lemma/inflection (`was`). The mpv backend prefers exact rows, then checks
+Unicode-casefold-equivalent inflections under the same lemma, and only if that
+fails checks casefold-equivalent lemma/inflection pairs. Exact database matches
+always take precedence. The backend caches the casefold index by database
+fingerprint; the tmpfs cache format is bumped when classification logic
+changes so old cue results are recomputed.
+
+The dictd companion tries the exact surface form and then the spaCy lemma. If
+the surface form and lemma differ only by capitalization, it tries the lemma
+first so a case-sensitive dictionary entry for the uppercase spelling does
+not shadow the lowercase lexical entry. It then tries Unicode-lowercase
+fallbacks, including German umlauts and `ẞ`. Dictionary cache keys retain the
+exact surface/lemma pair, avoiding collisions between entries such as `Arm`
+and `arm`.
 
 ## Status logic
 
