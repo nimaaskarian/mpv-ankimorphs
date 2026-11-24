@@ -120,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         query = build_query(args)
-        cards = invoke_gui_browse(query, endpoint=endpoint, api_key=api_key)
+        cards = invoke_gui_browse(query, endpoint=args.endpoint, api_key=args.api_key)
     except (ValueError, RuntimeError) as exc:
         print(f"AnkiMorphs Browser search: {exc}", file=sys.stderr)
         return 1

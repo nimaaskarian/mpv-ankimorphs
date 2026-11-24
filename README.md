@@ -4,6 +4,8 @@ A Lua mpv script plus a persistent Python backend. It uses the selected subtitle
 
 Analyzed cue results are cached in a private SQLite database on tmpfs: `/tmp/mpv-ankimorphs-<UID>/highlights.sqlite3`. This cache survives mpv restarts but is volatile: it disappears when `/tmp` is cleared or the machine reboots. It never writes cache data into the Anki profile. The default directory is mode `0700`; the cache is bounded to 30,000 cues.
 
+![a screenshot of mpv-ankimorphs](images/2026-11-24-075915.png)
+
 ## Install
 
 ```sh
