@@ -600,7 +600,11 @@ local function render_tooltip(value, anchor, force)
     )
     tooltip_overlay.res_x = width
     tooltip_overlay.res_y = height
-    tooltip_overlay.data = background .. header .. ass_escape(tooltip_text)
+    -- Each physical line in an ass-events overlay becomes a separate ASS
+    -- Dialogue event. Keep the rectangle and text in the same overlay, but
+    -- give them independent positioning origins. A second \pos tag inside
+    -- one event does not independently position the drawing and the text.
+    tooltip_overlay.data = background .. "\n" .. header .. ass_escape(tooltip_text)
     tooltip_overlay:update()
 end
 

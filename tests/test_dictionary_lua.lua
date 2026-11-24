@@ -92,6 +92,17 @@ assert(overlays[1].z == 10, "dictionary tooltip must render above the main subti
 assert(overlays[1].data:find("\\p1", 1, true), "tooltip should draw its background rectangle")
 assert(overlays[1].data:find("\\1c&H000000&", 1, true), "tooltip background should be black by default")
 assert(overlays[1].data:find("\\1a&H99&", 1, true), "40% opacity should map to ASS alpha 99")
+local background_event, text_event = overlays[1].data:match("^(.-)\n(.*)$")
+assert(background_event and text_event,
+  "tooltip background and text must be separate ASS events in the same overlay")
+assert(not text_event:find("\\p1", 1, true),
+  "tooltip text must not remain in the background drawing event")
+local bx, by = background_event:match("\\pos%(([%d%.%-]+),([%d%.%-]+)%)")
+local tx, ty = text_event:match("\\pos%(([%d%.%-]+),([%d%.%-]+)%)")
+assert(bx and by and tx and ty, "background and text need independent ASS positions")
+bx, by, tx, ty = tonumber(bx), tonumber(by), tonumber(tx), tonumber(ty)
+assert(tx > bx and ty > by,
+  "tooltip text origin must be inside the background rectangle, after its padding")
 assert(bindings["MBTN_LEFT"], "left-click binding missing")
 assert(bindings["MBTN_RIGHT"], "right-click binding missing")
 assert(bindings["ctrl+alt+e"], "extension toggle key binding missing")
