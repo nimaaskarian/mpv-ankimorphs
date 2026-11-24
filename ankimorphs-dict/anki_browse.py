@@ -54,9 +54,14 @@ def build_query(args) -> str:
         terms.append(morph_term)
 
     if args.phrase is not None:
-        args.phrase = " ".join(args.phrase.split())
-        if args.phrase:
-            terms.append(_quoted(args.phrase))
+        phrase = " ".join(args.phrase.split())
+        if phrase:
+            terms.append(_quoted(phrase))
+    if args.tags is not None:
+        tags = 'tag:' + _quoted(args.tags, escape_colons=False)
+        if tags:
+            terms.append(tags)
+        
 
     return " ".join(terms)
 
@@ -112,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('-p', '--phrase', default=None)
     parser.add_argument('-w', '--word', default=None)
     parser.add_argument('-d', '--deck', default=os.environ.get("ANKIMORPHS_BROWSE_DECK", DEFAULT_DECK))
+    parser.add_argument('-t', '--tags', default=None)
     parser.add_argument('-a', '--api-key', default=os.environ.get("ANKICONNECT_KEY", ""))
     parser.add_argument('-e', '--endpoint', default=os.environ.get("ANKICONNECT_URL", DEFAULT_URL))
     args = parser.parse_args(argv)
